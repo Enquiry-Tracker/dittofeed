@@ -5,11 +5,14 @@ import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 import { schemaValidateWithErr } from "isomorphic-lib/src/resultHandling/schemaValidation";
 import {
   ChannelType,
+  EmailProviderType,
+  EmailTemplateResource,
   InternalEventType,
   JsonResultType,
   MessageTemplateTestRequest,
   MessageTemplateTestResponse,
   ParsedWebhookBody,
+  SubscriptionGroupType,
   WebhookTemplateResource,
 } from "isomorphic-lib/src/types";
 
@@ -17,6 +20,11 @@ import { insert } from "../db";
 import { secret as dbSecret, workspace as dbWorkspace } from "../db/schema";
 import logger from "../logger";
 import { testTemplate, upsertMessageTemplate } from "../messaging";
+import { upsertEmailProvider } from "../messaging/email";
+import {
+  upsertSubscriptionGroup,
+  upsertSubscriptionSecret,
+} from "../subscriptionGroups";
 import { Workspace } from "../types";
 
 jest.mock("axios");
@@ -207,5 +215,61 @@ describe("testTemplate", () => {
 
       expect(result.value.type).toBe(InternalEventType.MessageSent);
     }
+  });
+
+  describe("email test sends are transactional (no List-* bulk headers)", () => {
+    async function setupEmail() {
+      const template = unwrap(
+        await upsertMessageTemplate({
+          name: randomUUID(),
+          workspaceId: workspace.id,
+          definition: {
+            type: ChannelType.Email,
+            from: "support@company.com",
+            subject: "Hello",
+            body: "Hello.",
+          } satisfies EmailTemplateResource,
+        }),
+      );
+      // testTemplate auto-attaches the FIRST subscription group for the
+      // workspace+channel. Even so, because it sends with isPreview, the
+      // List-* bulk headers must be suppressed (test/preview sends are
+      // transactional, e.g. one-time passcodes).
+      await Promise.all([
+        upsertEmailProvider({
+          workspaceId: workspace.id,
+          config: { type: EmailProviderType.Test },
+        }),
+        upsertSubscriptionGroup({
+          workspaceId: workspace.id,
+          name: `group-${randomUUID()}`,
+          type: SubscriptionGroupType.OptOut,
+          channel: ChannelType.Email,
+        }).then(unwrap),
+        upsertSubscriptionSecret({ workspaceId: workspace.id }),
+      ]);
+      return template;
+    }
+
+    it("omits the List-* bulk headers even with a subscription group present", async () => {
+      const template = await setupEmail();
+      const request: MessageTemplateTestRequest = {
+        workspaceId: workspace.id,
+        templateId: template.id,
+        channel: ChannelType.Email,
+        provider: EmailProviderType.Test,
+        userProperties: { id: "test-user", email: "test@email.com" },
+      };
+      const result = unwrap(await testTemplate(request));
+      if (
+        result.type !== InternalEventType.MessageSent ||
+        result.variant.type !== ChannelType.Email
+      ) {
+        throw new Error("Expected email message sent");
+      }
+      expect(result.variant.headers?.["List-Unsubscribe"]).toBeUndefined();
+      expect(result.variant.headers?.["List-Unsubscribe-Post"]).toBeUndefined();
+      expect(result.variant.headers?.["List-ID"]).toBeUndefined();
+    });
   });
 });

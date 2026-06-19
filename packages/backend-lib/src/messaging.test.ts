@@ -266,6 +266,83 @@ describe("messaging", () => {
       });
     });
 
+    describe("List-* bulk headers for transactional (hidden/preview) sends", () => {
+      let template: MessageTemplate;
+      let subscriptionGroup: SubscriptionGroup;
+      beforeEach(async () => {
+        ({ template, subscriptionGroup } = await setupEmailTemplate(workspace));
+      });
+
+      const baseParams = (
+        workspaceId: string,
+        templateId: string,
+        sg: SubscriptionGroup,
+      ) => ({
+        workspaceId,
+        templateId,
+        messageTags: {
+          workspaceId,
+          templateId,
+          runId: "run-id-1",
+          nodeId: "node-id-1",
+          messageId: "message-id-1",
+        } satisfies MessageTags,
+        userPropertyAssignments: {
+          id: 1234,
+          email: "test@email.com",
+        },
+        userId: "1234",
+        useDraft: false,
+        subscriptionGroupDetails: {
+          id: sg.id,
+          name: sg.name,
+          type: SubscriptionGroupType.OptOut,
+          action: null,
+        },
+        providerOverride: EmailProviderType.Test,
+      });
+
+      const sendAndGetHeaders = async (
+        overrides: Record<string, unknown>,
+      ) => {
+        const payload = await sendEmail({
+          ...baseParams(workspace.id, template.id, subscriptionGroup),
+          ...overrides,
+        });
+        const result = unwrap(payload);
+        if (
+          result.type !== InternalEventType.MessageSent ||
+          result.variant.type !== ChannelType.Email
+        ) {
+          throw new Error("Expected email message sent");
+        }
+        return result.variant.headers;
+      };
+
+      it("omits the List-* headers when isHidden is true", async () => {
+        const headers = await sendAndGetHeaders({ isHidden: true });
+        expect(headers?.["List-Unsubscribe"]).toBeUndefined();
+        expect(headers?.["List-Unsubscribe-Post"]).toBeUndefined();
+        expect(headers?.["List-ID"]).toBeUndefined();
+      });
+
+      it("omits the List-* headers when isPreview is true", async () => {
+        const headers = await sendAndGetHeaders({ isPreview: true });
+        expect(headers?.["List-Unsubscribe"]).toBeUndefined();
+        expect(headers?.["List-Unsubscribe-Post"]).toBeUndefined();
+        expect(headers?.["List-ID"]).toBeUndefined();
+      });
+
+      it("includes the List-* headers for a normal (logged) send (control)", async () => {
+        const headers = await sendAndGetHeaders({});
+        expect(headers?.["List-Unsubscribe"]).toBeDefined();
+        expect(headers?.["List-Unsubscribe-Post"]).toBe(
+          "List-Unsubscribe=One-Click",
+        );
+        expect(headers?.["List-ID"]).toBeDefined();
+      });
+    });
+
     describe("when template has custom identifierKey", () => {
       let template: MessageTemplate;
       let subscriptionGroup: SubscriptionGroup;

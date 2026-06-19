@@ -515,6 +515,12 @@ export interface SendMessageParametersBase {
   messageTags?: MessageTags;
   useDraft: boolean;
   isPreview?: boolean;
+  // True when this send is hidden from the deliveries/comms log (e.g. the
+  // `hidden` event context). Hidden and preview sends are treated as
+  // transactional: the List-Unsubscribe / List-Unsubscribe-Post / List-ID bulk
+  // headers are suppressed so the message does not look like bulk/marketing mail
+  // to spam filters (e.g. one-time passcodes). See sendEmail().
+  isHidden?: boolean;
 }
 
 export interface SendMessageParametersEmail extends SendMessageParametersBase {
@@ -846,6 +852,7 @@ export async function sendEmail({
   providerOverride,
   useDraft,
   isPreview,
+  isHidden,
 }: Omit<
   SendMessageParametersEmail,
   "channel"
@@ -1047,7 +1054,10 @@ export async function sendEmail({
     UnsubscribeHeaders,
     MessageTemplateRenderError
   > | null =
-    subscriptionGroupDetails && subscriptionGroupSecret
+    subscriptionGroupDetails &&
+    subscriptionGroupSecret &&
+    !isPreview &&
+    !isHidden
       ? constructUnsubscribeHeaders({
           to,
           from,
