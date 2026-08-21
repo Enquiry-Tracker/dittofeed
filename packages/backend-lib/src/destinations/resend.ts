@@ -29,8 +29,45 @@ function guardResponseError(payload: unknown): ErrorResponse {
 export type ResendRequiredData = Parameters<Resend["emails"]["send"]>["0"];
 export type ResendResponse = Awaited<ReturnType<Resend["emails"]["send"]>>;
 
-/* 
- Resend's client does not throw an error and instead returns a nullish error 
+/**
+ * Resend error codes describing a transient condition rather than a bad
+ * request: the same payload sent a moment later can succeed.
+ *
+ * `rate_limit_exceeded` is the one that matters in practice. Resend caps an
+ * account at 10 requests/second and a campaign burst blows past that in a
+ * fraction of a second — one school's send produced 156 rejections in 14
+ * seconds. Without a retry those messages are never delivered at all.
+ */
+const RETRYABLE_ERROR_NAMES = new Set<ErrorResponse["name"]>([
+  "rate_limit_exceeded",
+  "application_error",
+  "internal_server_error",
+]);
+
+export function isRetryableResendError(name: ErrorResponse["name"]): boolean {
+  return RETRYABLE_ERROR_NAMES.has(name);
+}
+
+export const MAX_SEND_ATTEMPTS = 4;
+const RETRY_BASE_DELAY_MS = 500;
+
+/**
+ * Full jitter, not a fixed backoff: parallel sends hit an account-wide rate
+ * limit at the same instant, so a deterministic delay only lines them up to
+ * collide again on every subsequent attempt.
+ */
+function retryDelayMs(attempt: number): number {
+  return Math.random() * RETRY_BASE_DELAY_MS * 2 ** attempt;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/*
+ Resend's client does not throw an error and instead returns a nullish error
  object that's why we wrap it out in our wrapper function
  */
 const sendMailWrapper = async (
@@ -38,13 +75,32 @@ const sendMailWrapper = async (
   mailData: ResendRequiredData,
 ) => {
   const resend = new Resend(apiKey);
-  const response = await resend.emails.send(mailData);
-  if (response.error) {
-    throw new Error(response.error.message, {
-      cause: response.error.name,
-    });
+
+  // Retries live here rather than being delegated to the Temporal activity that
+  // wraps this call. Letting the error escape would fail the activity, and a
+  // failed activity records no `DFMessageFailure` event — the very signal
+  // monitoring counts to notice that sending is unhealthy. Retrying in place
+  // keeps that contract: a transient blip is absorbed, a sustained one still
+  // surfaces as a message failure carrying the provider's own error.
+  for (let attempt = 0; ; attempt++) {
+    // eslint-disable-next-line no-await-in-loop
+    const response = await resend.emails.send(mailData);
+    if (!response.error) {
+      return response;
+    }
+    const { name, message } = response.error;
+    const lastAttempt = attempt >= MAX_SEND_ATTEMPTS - 1;
+    if (!isRetryableResendError(name) || lastAttempt) {
+      throw new Error(message, { cause: name });
+    }
+    const delay = retryDelayMs(attempt);
+    logger().info(
+      { name, message, attempt: attempt + 1, delay },
+      "retrying resend send after transient provider error",
+    );
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(delay);
   }
-  return response;
 };
 
 export async function sendMail({
