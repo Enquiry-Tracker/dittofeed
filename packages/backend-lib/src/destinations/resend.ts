@@ -30,18 +30,24 @@ export type ResendRequiredData = Parameters<Resend["emails"]["send"]>["0"];
 export type ResendResponse = Awaited<ReturnType<Resend["emails"]["send"]>>;
 
 /**
- * Resend error codes describing a transient condition rather than a bad
- * request: the same payload sent a moment later can succeed.
+ * Only `rate_limit_exceeded` is retried, and the narrowness is deliberate.
  *
- * `rate_limit_exceeded` is the one that matters in practice. Resend caps an
- * account at 10 requests/second and a campaign burst blows past that in a
- * fraction of a second — one school's send produced 156 rejections in 14
- * seconds. Without a retry those messages are never delivered at all.
+ * It is the code that matters in practice: Resend caps an account at 10
+ * requests/second and a campaign burst passes that in a fraction of a second —
+ * one school's send produced 156 rejections in 14 seconds, none of which were
+ * ever delivered. A 429 is also the only error where retrying is unambiguously
+ * safe: the request was rejected outright, so nothing was queued on their side.
+ *
+ * `application_error` / `internal_server_error` (500) are deliberately NOT
+ * retried. A 500 can mean the message was accepted and the failure happened
+ * afterwards, so a retry risks sending the same email twice — and the resend
+ * client (3.2.0) exposes no idempotency key to make that safe.
+ *
+ * ponytail: 500s stay terminal until the SDK gains idempotency keys; then add
+ * them here keyed on the Dittofeed messageId and retry 500s too.
  */
 const RETRYABLE_ERROR_NAMES = new Set<ErrorResponse["name"]>([
   "rate_limit_exceeded",
-  "application_error",
-  "internal_server_error",
 ]);
 
 export function isRetryableResendError(name: ErrorResponse["name"]): boolean {

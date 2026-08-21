@@ -95,11 +95,15 @@ describe("resend", () => {
   });
 
   describe("isRetryableResendError", () => {
-    it("treats rate limits and provider-side 500s as retryable", async () => {
+    it("treats a rate limit as retryable", async () => {
       const { isRetryableResendError } = await import("./resend");
       expect(isRetryableResendError("rate_limit_exceeded")).toBe(true);
-      expect(isRetryableResendError("application_error")).toBe(true);
-      expect(isRetryableResendError("internal_server_error")).toBe(true);
+    });
+
+    it("treats provider-side 500s as terminal, because a retry could duplicate the email", async () => {
+      const { isRetryableResendError } = await import("./resend");
+      expect(isRetryableResendError("application_error")).toBe(false);
+      expect(isRetryableResendError("internal_server_error")).toBe(false);
     });
 
     it("treats configuration errors as terminal", async () => {
