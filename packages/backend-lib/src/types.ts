@@ -269,6 +269,10 @@ export const TwilioEventSms = Type.Object({
   AccountSid: Type.String(),
   From: Type.String(),
   ApiVersion: Type.String(),
+  // ET-10281: present on undelivered/failed callbacks and the only thing that
+  // separates an unreachable handset (30003) from carrier filtering (30008).
+  // Twilio posts status callbacks form-encoded, so this arrives as a string.
+  ErrorCode: Type.Optional(Type.String()),
 });
 
 export type TwilioInboundSchema = Static<typeof TwilioEventSms>;

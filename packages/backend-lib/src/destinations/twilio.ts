@@ -125,10 +125,40 @@ export async function submitTwilioEvents({
     case TwilioMessageStatus.Failed:
       eventName = InternalEventType.SmsFailed;
       break;
+    // ET-10281: `undelivered` means Twilio accepted the message and the carrier
+    // did not deliver it — handset unreachable (30003), carrier rejection or
+    // filtering (30008). It is a terminal failure and was previously dropped
+    // here, so those sends still read as successful in delivery history. There
+    // is no SmsUndelivered internal event and adding one would ripple through
+    // segments, journeys and the UI, so it maps to SmsFailed; the exact status
+    // and Twilio error code are recorded in the event properties below, which
+    // keeps `failed` and `undelivered` distinguishable when querying.
+    case TwilioMessageStatus.Undelivered:
+      eventName = InternalEventType.SmsFailed;
+      break;
     case TwilioMessageStatus.Delivered:
       // TODO wrong
       eventName = InternalEventType.SmsDelivered;
       break;
+    // ET-10281: intermediate lifecycle statuses are not failures. Twilio began
+    // sending these on 2026-08-27 and each one was logged at error level — one
+    // "error" per SMS sent, 22 of the 36 events in the window that tripped the
+    // error-rate alert on 2026-09-09. Acknowledge them without writing an event.
+    case TwilioMessageStatus.Queued:
+    case TwilioMessageStatus.Sending:
+    case TwilioMessageStatus.Sent:
+    case TwilioMessageStatus.Accepted:
+    case TwilioMessageStatus.Scheduled:
+      logger().debug(
+        {
+          workspaceId,
+          userId,
+          smsStatus: TwilioEvent.SmsStatus,
+          messageSid: TwilioEvent.MessageSid,
+        },
+        "Intermediate Twilio status, no event recorded",
+      );
+      return ok(undefined);
     default:
       logger().error(
         {
@@ -161,6 +191,13 @@ export async function submitTwilioEvents({
       workspaceId,
       userId,
       body,
+      // ET-10281: without these, an undelivered send is indistinguishable from a
+      // failed one and the carrier reason is lost. errorCode is what separates an
+      // unreachable handset (30003) from carrier filtering (30008).
+      smsStatus: TwilioEvent.SmsStatus,
+      ...(TwilioEvent.ErrorCode !== undefined
+        ? { errorCode: TwilioEvent.ErrorCode }
+        : {}),
       ...tags,
     },
   } as BatchTrackData;
