@@ -131,16 +131,18 @@ describe("apps", () => {
 
       startKeyedJourneyImpl = jest.fn();
 
-      // Import the actual triggerEventEntryJourneysFactory from the unmocked module.
-      const { triggerEventEntryJourneysFactory } =
-        jest.requireActual("./journeys");
-
-      // Built from the production options on purpose. useClones defaults to true,
-      // and under it a cached promise is deep-cloned into a second promise nobody
-      // awaits — a failed load then rejects unhandled and Node 20 exits. A cache
-      // built with NodeCache's defaults here would not exercise what ships.
-      const { EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS } =
-        jest.requireActual<typeof import("./journeys")>("./journeys");
+      // Import the actual implementation from the unmocked module. Typed, so the
+      // factory call below is checked rather than `any`.
+      //
+      // The cache is built from the PRODUCTION options on purpose: useClones
+      // defaults to true, and under it a cached promise is deep-cloned into a
+      // second promise nobody awaits — a failed load then rejects unhandled and
+      // Node 20 exits. A cache built with NodeCache's defaults would not exercise
+      // what ships.
+      const {
+        triggerEventEntryJourneysFactory,
+        EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS,
+      } = jest.requireActual<typeof import("./journeys")>("./journeys");
       journeyCache = new NodeCache(EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS);
       // Held as a variable rather than asserted via journeyCache.del — referencing
       // the method unbound trips @typescript-eslint/unbound-method.
@@ -228,6 +230,27 @@ describe("apps", () => {
         // this was three.
         expect(findMany).toHaveBeenCalledTimes(1);
         expect(startKeyedJourneyImpl).toHaveBeenCalledTimes(3);
+
+        // And a SECOND batch inside the TTL must be served from cache. This is the
+        // property that matters and the one nothing covered: an earlier revision
+        // stamped the TTL at store time instead of resolve, so the entry expired
+        // before it ever served a hit — the cache never populated and every test
+        // above still passed.
+        await submitBatchWithTriggers({
+          workspaceId,
+          data: {
+            batch: [
+              {
+                type: EventType.Track,
+                event: entryEventName,
+                messageId: uuidv4(),
+                userId,
+                properties: { amount: 100, itemId: "123" },
+              },
+            ],
+          },
+        });
+        expect(findMany).toHaveBeenCalledTimes(1);
       } finally {
         findMany.mockRestore();
       }

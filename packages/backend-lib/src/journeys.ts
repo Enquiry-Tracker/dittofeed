@@ -699,6 +699,16 @@ export async function getJourneysStats({
  */
 export const EVENT_TRIGGER_JOURNEY_CACHE_TTL_S = 30;
 
+/**
+ * Upper bound on how long an in-flight load may hold the cache key.
+ *
+ * Only a backstop: a healthy load replaces it with the real TTL on resolve, and a
+ * failed one evicts. It exists so a load that never settles cannot pin the key
+ * forever — the pg pool has no connection timeout, and node-cache never expires
+ * entries stored with ttl 0.
+ */
+const IN_FLIGHT_CEILING_S = 300;
+
 export const EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS = {
   stdTTL: EVENT_TRIGGER_JOURNEY_CACHE_TTL_S,
   checkperiod: 120,
@@ -861,17 +871,29 @@ export function triggerEventEntryJourneysFactory({
           throw e;
         },
       );
-      // ttl 0 = no expiry while the load is in flight; the real TTL is stamped
-      // above once it resolves. node-cache computes expiry at SET time, so storing
-      // with the normal TTL here would let a load slower than 30s expire before it
-      // ever served a hit — the cache would never populate and the stampede would
-      // become permanent rather than occasional. Verified against the installed
-      // node-cache: with a 1s TTL and a 1.5s load, two sequential calls ran two
-      // loads and the entry was gone afterwards.
+      // Stored under a CEILING, not the normal TTL and not zero.
       //
-      // The raw load is what goes in, so the identity checks above can recognise
-      // it; `pending` always carries handlers, so nothing rejects unobserved.
-      journeyCache.set(workspaceId, load, 0);
+      // Not the normal TTL: node-cache computes expiry at SET time, so a load
+      // slower than 30s would expire before it ever served a hit — the cache would
+      // never populate and the stampede would become permanent. Verified: with a
+      // 1s TTL and a 1.5s load, two sequential calls ran two loads.
+      //
+      // Not zero either: node-cache never sweeps entries with t === 0, so a load
+      // that never settles would pin this key for the life of the pod and every
+      // later caller for the workspace would await a dead promise. That is
+      // reachable — db.ts builds its pg Pool with a connection string and no
+      // connectionTimeoutMillis, so a checkout behind ten slow clients waits
+      // forever, as does a half-open socket with no keepAlive. Verified against
+      // the installed node-cache: a t=0 entry survives every checkperiod sweep.
+      //
+      // The ceiling bounds that. A load still running after five minutes is dead;
+      // letting the key expire lets new traffic retry. Callers already awaiting the
+      // dead promise stay stuck — ending that needs an explicit timeout on the
+      // query, which belongs in db.ts, not here.
+      //
+      // The resolve path above replaces this with the real TTL, so a normal load
+      // still expires 30s after it finished, not 30s after it started.
+      journeyCache.set(workspaceId, load, IN_FLIGHT_CEILING_S);
     }
     const journeyDetails = await pending;
 
