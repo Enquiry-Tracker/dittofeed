@@ -685,10 +685,27 @@ export async function getJourneysStats({
   return journeysStats;
 }
 
-const EVENT_TRIGGER_JOURNEY_CACHE = new NodeCache({
+/**
+ * Options for the event-trigger journey cache. Exported so tests exercise the
+ * production configuration rather than NodeCache's defaults.
+ *
+ * useClones: false is REQUIRED, not a tuning knob. This cache holds an in-flight
+ * promise, and node-cache's default deep-clones on both set and get. Cloning a
+ * promise produces a SECOND promise that nothing awaits, so a failed load rejects
+ * unhandled — which on Node 20 exits the process. Verified against the installed
+ * node-cache: with useClones true a single-caller failure leaves an unhandled
+ * rejection, with it false none. Cloning also deep-copies every journey definition
+ * on every get, which would put the per-event CPU cost straight back.
+ */
+export const EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS = {
   stdTTL: 30,
   checkperiod: 120,
-});
+  useClones: false,
+} as const;
+
+const EVENT_TRIGGER_JOURNEY_CACHE = new NodeCache(
+  EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS,
+);
 
 let JOURNEY_TRIGGER_COUNTER: Counter | null = null;
 
@@ -724,8 +741,17 @@ interface EventTriggerJourneyDetails {
 async function loadEventTriggerJourneyDetails(
   workspaceId: string,
 ): Promise<EventTriggerJourneyDetails[]> {
+  // Filter by status in SQL, not after conversion. Every row returned here is
+  // pushed through toJourneyResource -> enrichJourney, the TypeBox validation that
+  // costs ~0.074 ms each and blocks the event loop; converting rows only to discard
+  // the non-Running ones is the bulk of that cost. `status` is a real pgEnum column
+  // and passes through enrichJourney unmodified, so this is exactly equivalent to
+  // the predicate it replaces.
   const allJourneys = await db().query.journey.findMany({
-    where: eq(dbJourney.workspaceId, workspaceId),
+    where: and(
+      eq(dbJourney.workspaceId, workspaceId),
+      eq(dbJourney.status, JourneyResourceStatusEnum.Running),
+    ),
   });
   return allJourneys.flatMap((j) => {
     const result = toJourneyResource(j);
@@ -777,34 +803,35 @@ export function triggerEventEntryJourneysFactory({
     event: triggerEvent,
     userId,
   }: TriggerEventEntryJourneysOptions): Promise<void> {
-    // The cache holds the in-flight PROMISE, not the resolved value, and it is
-    // stored BEFORE the load is awaited. That single detail is the whole fix.
-    //
+    // Cache the in-flight PROMISE, not the value, and store it BEFORE awaiting.
     // submitBatchWithTriggers calls this once per Track message via Promise.all,
-    // so every event of a batch arrives here concurrently. Caching the resolved
-    // value meant none of them found anything — the cache was only written after
-    // the load finished — and each ran its own full load. With a workspace holding
-    // 44,286 journeys that was 3.3s of blocking CPU each (measured 0.074 ms per
-    // journey in toJourneyResource), so a fifteen-event batch blocked the event
-    // loop for roughly fifty seconds. The pod stopped answering anything at all,
-    // its liveness probe failed, and it was killed and restarted — which emptied
-    // the cache and guaranteed the next batch did it again. That loop ran for ten
-    // hours on 2026-09-21 and for three days from 09-25 (ET-10394).
+    // so a batch's events arrive concurrently; caching the resolved value meant
+    // every one of them missed and ran its own full load (ET-10394).
     //
-    // Storing the promise makes concurrent callers share one load. The rejection
-    // handler is not optional: without it a failed load would stay cached for the
-    // full TTL and every caller for that workspace would get the same error back.
+    // The cache MUST be constructed with useClones: false — see
+    // EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS. A cloning cache breaks both the identity
+    // check below and the rejection handling above it.
+    //
+    // ponytail: single-flight only holds while a load finishes inside the TTL.
+    // At ~3.3s per load against a 30s TTL there is ~9x headroom; if journey counts
+    // grow enough to cross it, loads start overlapping again and this needs a
+    // proper in-flight map keyed independently of the TTL.
     let pending: Promise<EventTriggerJourneyDetails[]> | undefined =
       journeyCache.get(workspaceId);
 
     if (!pending) {
-      pending = loadEventTriggerJourneyDetails(workspaceId).catch(
-        (e: unknown) => {
+      const load = loadEventTriggerJourneyDetails(workspaceId);
+      pending = load.catch((e: unknown) => {
+        // Evict only our own entry. If the TTL expired while this load was in
+        // flight, another caller may already have stored a healthy replacement.
+        if (journeyCache.get(workspaceId) === load) {
           journeyCache.del(workspaceId);
-          throw e;
-        },
-      );
-      journeyCache.set(workspaceId, pending);
+        }
+        throw e;
+      });
+      // Store the raw load so the identity check above can recognise it; `pending`
+      // always carries a handler, so nothing is left to reject unobserved.
+      journeyCache.set(workspaceId, load);
     }
     const journeyDetails = await pending;
 

@@ -134,10 +134,13 @@ describe("apps", () => {
       const { triggerEventEntryJourneysFactory } =
         jest.requireActual("./journeys");
 
-      // Held in scope (and spied) so the stampede test can count how many times a
-      // whole batch loads the workspace's journeys — see ET-10394.
-      journeyCache = new NodeCache();
-      jest.spyOn(journeyCache, "set");
+      // Built from the production options on purpose. useClones defaults to true,
+      // and under it a cached promise is deep-cloned into a second promise nobody
+      // awaits — a failed load then rejects unhandled and Node 20 exits. A cache
+      // built with NodeCache's defaults here would not exercise what ships.
+      const { EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS } =
+        jest.requireActual<typeof import("./journeys")>("./journeys");
+      journeyCache = new NodeCache(EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS);
       jest.spyOn(journeyCache, "del");
 
       // Re-mock the journeys module with our custom implementation.
@@ -200,22 +203,30 @@ describe("apps", () => {
     // One cache write proves one load was shared; three would mean the stampede.
     it("loads a workspace's journeys once per batch, not once per event", async () => {
       const userId = uuidv4();
+      const dbModule = await import("./db");
+      const findMany = jest.spyOn(dbModule.db().query.journey, "findMany");
 
-      await submitBatchWithTriggers({
-        workspaceId,
-        data: {
-          batch: [1, 2, 3].map(() => ({
-            type: EventType.Track,
-            event: entryEventName,
-            messageId: uuidv4(),
-            userId,
-            properties: { amount: 100, itemId: "123" },
-          })),
-        },
-      });
+      try {
+        await submitBatchWithTriggers({
+          workspaceId,
+          data: {
+            batch: [1, 2, 3].map(() => ({
+              type: EventType.Track,
+              event: entryEventName,
+              messageId: uuidv4(),
+              userId,
+              properties: { amount: 100, itemId: "123" },
+            })),
+          },
+        });
 
-      expect(journeyCache.set).toHaveBeenCalledTimes(1);
-      expect(startKeyedJourneyImpl).toHaveBeenCalledTimes(3);
+        // The direct measure: three concurrent triggers, one load. Before the fix
+        // this was three.
+        expect(findMany).toHaveBeenCalledTimes(1);
+        expect(startKeyedJourneyImpl).toHaveBeenCalledTimes(3);
+      } finally {
+        findMany.mockRestore();
+      }
     });
 
     // A rejected load must not stay in the cache. Without the catch that evicts it,
@@ -242,14 +253,17 @@ describe("apps", () => {
         },
       });
 
-      await expect(submitBatchWithTriggers(oneTrackEvent())).rejects.toThrow(
-        "load failed",
-      );
-      expect(journeyCache.del).toHaveBeenCalledWith(workspaceId);
-      expect(journeyCache.get(workspaceId)).toBeUndefined();
+      try {
+        await expect(submitBatchWithTriggers(oneTrackEvent())).rejects.toThrow(
+          "load failed",
+        );
+        expect(journeyCache.del).toHaveBeenCalledWith(workspaceId);
+        expect(journeyCache.get(workspaceId)).toBeUndefined();
+      } finally {
+        findMany.mockRestore();
+      }
 
       // The next caller retries instead of being handed the cached rejection.
-      findMany.mockRestore();
       await submitBatchWithTriggers(oneTrackEvent());
       expect(journeyCache.get(workspaceId)).toBeDefined();
     });
