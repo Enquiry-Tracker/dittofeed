@@ -712,6 +712,49 @@ interface EventTriggerJourneyDetails {
   definition: JourneyDefinition;
 }
 
+/**
+ * Loads and converts every journey of a workspace down to the event-entry ones.
+ *
+ * Extracted from builtTriggerEventEntryJourneys so the whole load can be handed
+ * to the cache as a single promise — see the comment at the call site. The cost
+ * is linear in the workspace's journey count and is spent BLOCKING the event
+ * loop in the flatMap below, so it must happen once per workspace per TTL, never
+ * once per event.
+ */
+async function loadEventTriggerJourneyDetails(
+  workspaceId: string,
+): Promise<EventTriggerJourneyDetails[]> {
+  const allJourneys = await db().query.journey.findMany({
+    where: eq(dbJourney.workspaceId, workspaceId),
+  });
+  return allJourneys.flatMap((j) => {
+    const result = toJourneyResource(j);
+    if (result.isErr()) {
+      logger().error(
+        {
+          workspaceId,
+          journeyId: j.id,
+        },
+        "Failed to convert journey to resource",
+      );
+      return [];
+    }
+    const journey = result.value;
+    if (
+      journey.status !== JourneyResourceStatusEnum.Running ||
+      journey.definition.entryNode.type !== JourneyNodeType.EventEntryNode
+    ) {
+      return [];
+    }
+    return {
+      event: journey.definition.entryNode.event,
+      journeyId: journey.id,
+      definition: journey.definition,
+      journeyName: journey.name,
+    };
+  });
+}
+
 export type TriggerEventEntryJourneysOptions = Omit<
   StartKeyedUserJourneyProps,
   "definition" | "journeyId"
@@ -734,41 +777,36 @@ export function triggerEventEntryJourneysFactory({
     event: triggerEvent,
     userId,
   }: TriggerEventEntryJourneysOptions): Promise<void> {
-    let journeyDetails: EventTriggerJourneyDetails[] | undefined =
+    // The cache holds the in-flight PROMISE, not the resolved value, and it is
+    // stored BEFORE the load is awaited. That single detail is the whole fix.
+    //
+    // submitBatchWithTriggers calls this once per Track message via Promise.all,
+    // so every event of a batch arrives here concurrently. Caching the resolved
+    // value meant none of them found anything — the cache was only written after
+    // the load finished — and each ran its own full load. With a workspace holding
+    // 44,286 journeys that was 3.3s of blocking CPU each (measured 0.074 ms per
+    // journey in toJourneyResource), so a fifteen-event batch blocked the event
+    // loop for roughly fifty seconds. The pod stopped answering anything at all,
+    // its liveness probe failed, and it was killed and restarted — which emptied
+    // the cache and guaranteed the next batch did it again. That loop ran for ten
+    // hours on 2026-09-21 and for three days from 09-25 (ET-10394).
+    //
+    // Storing the promise makes concurrent callers share one load. The rejection
+    // handler is not optional: without it a failed load would stay cached for the
+    // full TTL and every caller for that workspace would get the same error back.
+    let pending: Promise<EventTriggerJourneyDetails[]> | undefined =
       journeyCache.get(workspaceId);
 
-    if (!journeyDetails) {
-      const allJourneys = await db().query.journey.findMany({
-        where: eq(dbJourney.workspaceId, workspaceId),
-      });
-      journeyDetails = allJourneys.flatMap((j) => {
-        const result = toJourneyResource(j);
-        if (result.isErr()) {
-          logger().error(
-            {
-              workspaceId,
-              journeyId: j.id,
-            },
-            "Failed to convert journey to resource",
-          );
-          return [];
-        }
-        const journey = result.value;
-        if (
-          journey.status !== JourneyResourceStatusEnum.Running ||
-          journey.definition.entryNode.type !== JourneyNodeType.EventEntryNode
-        ) {
-          return [];
-        }
-        return {
-          event: journey.definition.entryNode.event,
-          journeyId: journey.id,
-          definition: journey.definition,
-          journeyName: journey.name,
-        };
-      });
-      journeyCache.set(workspaceId, journeyDetails);
+    if (!pending) {
+      pending = loadEventTriggerJourneyDetails(workspaceId).catch(
+        (e: unknown) => {
+          journeyCache.del(workspaceId);
+          throw e;
+        },
+      );
+      journeyCache.set(workspaceId, pending);
     }
+    const journeyDetails = await pending;
 
     const starts: Promise<unknown>[] = journeyDetails.flatMap(
       ({ journeyId, journeyName, event: journeyEvent, definition }) => {
