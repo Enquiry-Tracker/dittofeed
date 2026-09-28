@@ -697,8 +697,10 @@ export async function getJourneysStats({
  * rejection, with it false none. Cloning also deep-copies every journey definition
  * on every get, which would put the per-event CPU cost straight back.
  */
+export const EVENT_TRIGGER_JOURNEY_CACHE_TTL_S = 30;
+
 export const EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS = {
-  stdTTL: 30,
+  stdTTL: EVENT_TRIGGER_JOURNEY_CACHE_TTL_S,
   checkperiod: 120,
   useClones: false,
 } as const;
@@ -741,12 +743,17 @@ interface EventTriggerJourneyDetails {
 async function loadEventTriggerJourneyDetails(
   workspaceId: string,
 ): Promise<EventTriggerJourneyDetails[]> {
-  // Filter by status in SQL, not after conversion. Every row returned here is
-  // pushed through toJourneyResource -> enrichJourney, the TypeBox validation that
-  // costs ~0.074 ms each and blocks the event loop; converting rows only to discard
-  // the non-Running ones is the bulk of that cost. `status` is a real pgEnum column
-  // and passes through enrichJourney unmodified, so this is exactly equivalent to
-  // the predicate it replaces.
+  // Filter by status in SQL rather than after conversion: every row returned here
+  // is pushed through toJourneyResource -> enrichJourney, the TypeBox validation
+  // measured at ~0.074 ms, and converting rows only to discard them is waste.
+  // `status` is a real pgEnum column and passes through enrichJourney unmodified,
+  // so this is exactly equivalent to the JS predicate it replaces.
+  //
+  // Honest about the size of the win: on the workspace that caused ET-10394 all
+  // 44,286 journeys were Running, so this removed nothing there. The predicate
+  // that would actually bound this set is the entry-node type, which lives inside
+  // the `definition` jsonb and is still filtered in JS below. Worth pushing down
+  // too, but it is a separate change and wants measuring first.
   const allJourneys = await db().query.journey.findMany({
     where: and(
       eq(dbJourney.workspaceId, workspaceId),
@@ -760,7 +767,12 @@ async function loadEventTriggerJourneyDetails(
         {
           workspaceId,
           journeyId: j.id,
+          err: result.error,
         },
+        // Every row reaching here is now a Running journey — the SQL filter
+        // removed the statuses that used to make this line background noise. A
+        // Running journey that fails validation has silently stopped firing, so
+        // the error itself is the only thing that says why.
         "Failed to convert journey to resource",
       );
       return [];
@@ -798,6 +810,17 @@ export function triggerEventEntryJourneysFactory({
   journeyCache: NodeCache;
   startKeyedJourneyImpl: typeof startKeyedUserJourney;
 }) {
+  // Fail loudly at construction rather than at 3am. This cache holds promises, and
+  // a cloning cache both leaks unhandled rejections (process exit on Node 20) and
+  // silently disables the identity guards below, because get never returns the same
+  // reference it was given. A comment is not enough for a precondition that costs
+  // the process.
+  if (journeyCache.options.useClones !== false) {
+    throw new Error(
+      "triggerEventEntryJourneysFactory requires a NodeCache built with useClones: false — see EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS",
+    );
+  }
+
   return async function builtTriggerEventEntryJourneys({
     workspaceId,
     event: triggerEvent,
@@ -821,17 +844,34 @@ export function triggerEventEntryJourneysFactory({
 
     if (!pending) {
       const load = loadEventTriggerJourneyDetails(workspaceId);
-      pending = load.catch((e: unknown) => {
-        // Evict only our own entry. If the TTL expired while this load was in
-        // flight, another caller may already have stored a healthy replacement.
-        if (journeyCache.get(workspaceId) === load) {
-          journeyCache.del(workspaceId);
-        }
-        throw e;
-      });
-      // Store the raw load so the identity check above can recognise it; `pending`
-      // always carries a handler, so nothing is left to reject unobserved.
-      journeyCache.set(workspaceId, load);
+      // Both settle paths are guarded by identity: if the entry was replaced while
+      // this load was in flight, it belongs to a later caller and is not ours to
+      // touch.
+      pending = load.then(
+        (details) => {
+          if (journeyCache.get(workspaceId) === load) {
+            journeyCache.ttl(workspaceId, EVENT_TRIGGER_JOURNEY_CACHE_TTL_S);
+          }
+          return details;
+        },
+        (e: unknown) => {
+          if (journeyCache.get(workspaceId) === load) {
+            journeyCache.del(workspaceId);
+          }
+          throw e;
+        },
+      );
+      // ttl 0 = no expiry while the load is in flight; the real TTL is stamped
+      // above once it resolves. node-cache computes expiry at SET time, so storing
+      // with the normal TTL here would let a load slower than 30s expire before it
+      // ever served a hit — the cache would never populate and the stampede would
+      // become permanent rather than occasional. Verified against the installed
+      // node-cache: with a 1s TTL and a 1.5s load, two sequential calls ran two
+      // loads and the entry was gone afterwards.
+      //
+      // The raw load is what goes in, so the identity checks above can recognise
+      // it; `pending` always carries handlers, so nothing rejects unobserved.
+      journeyCache.set(workspaceId, load, 0);
     }
     const journeyDetails = await pending;
 

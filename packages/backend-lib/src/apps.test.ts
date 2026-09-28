@@ -68,6 +68,7 @@ describe("apps", () => {
     let segmentEntryJourneyId: string;
     let entryEventName: string;
     let journeyCache: NodeCache;
+    let journeyCacheDel: jest.SpyInstance;
     let submitBatchWithTriggers: typeof import("./apps").submitBatchWithTriggers;
 
     beforeEach(async () => {
@@ -141,7 +142,9 @@ describe("apps", () => {
       const { EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS } =
         jest.requireActual<typeof import("./journeys")>("./journeys");
       journeyCache = new NodeCache(EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS);
-      jest.spyOn(journeyCache, "del");
+      // Held as a variable rather than asserted via journeyCache.del — referencing
+      // the method unbound trips @typescript-eslint/unbound-method.
+      journeyCacheDel = jest.spyOn(journeyCache, "del");
 
       // Re-mock the journeys module with our custom implementation.
       jest.doMock("./journeys", () => ({
@@ -200,7 +203,8 @@ describe("apps", () => {
     // only after the load finished, so concurrent events all missed and each ran a
     // full load. On a workspace with 44,286 journeys that was 3.3s of blocking CPU
     // per event — a batch this size froze the pod until liveness killed it.
-    // One cache write proves one load was shared; three would mean the stampede.
+    // Counting findMany is the direct measure: one load for three concurrent
+    // triggers. Before the fix it was three.
     it("loads a workspace's journeys once per batch, not once per event", async () => {
       const userId = uuidv4();
       const dbModule = await import("./db");
@@ -257,15 +261,20 @@ describe("apps", () => {
         await expect(submitBatchWithTriggers(oneTrackEvent())).rejects.toThrow(
           "load failed",
         );
-        expect(journeyCache.del).toHaveBeenCalledWith(workspaceId);
+        expect(journeyCacheDel).toHaveBeenCalledWith(workspaceId);
         expect(journeyCache.get(workspaceId)).toBeUndefined();
       } finally {
         findMany.mockRestore();
       }
 
       // The next caller retries instead of being handed the cached rejection.
+      // toBeDefined() would not prove that: the cache holds a promise written
+      // before the await, so a REJECTED one is "defined" too. Resolve it instead —
+      // beforeEach inserts exactly one Running EventEntryNode journey.
       await submitBatchWithTriggers(oneTrackEvent());
-      expect(journeyCache.get(workspaceId)).toBeDefined();
+      await expect(
+        journeyCache.get<Promise<unknown[]>>(workspaceId),
+      ).resolves.toHaveLength(1);
     });
   });
 });
