@@ -67,6 +67,8 @@ describe("apps", () => {
     let startedEventTriggeredJourneyId: string;
     let segmentEntryJourneyId: string;
     let entryEventName: string;
+    let journeyCache: NodeCache;
+    let journeyCacheDel: jest.SpyInstance;
     let submitBatchWithTriggers: typeof import("./apps").submitBatchWithTriggers;
 
     beforeEach(async () => {
@@ -129,14 +131,27 @@ describe("apps", () => {
 
       startKeyedJourneyImpl = jest.fn();
 
-      // Import the actual triggerEventEntryJourneysFactory from the unmocked module.
-      const { triggerEventEntryJourneysFactory } =
-        jest.requireActual("./journeys");
+      // Import the actual implementation from the unmocked module. Typed, so the
+      // factory call below is checked rather than `any`.
+      //
+      // The cache is built from the PRODUCTION options on purpose: useClones
+      // defaults to true, and under it a cached promise is deep-cloned into a
+      // second promise nobody awaits — a failed load then rejects unhandled and
+      // Node 20 exits. A cache built with NodeCache's defaults would not exercise
+      // what ships.
+      const {
+        triggerEventEntryJourneysFactory,
+        EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS,
+      } = jest.requireActual<typeof import("./journeys")>("./journeys");
+      journeyCache = new NodeCache(EVENT_TRIGGER_JOURNEY_CACHE_OPTIONS);
+      // Held as a variable rather than asserted via journeyCache.del — referencing
+      // the method unbound trips @typescript-eslint/unbound-method.
+      journeyCacheDel = jest.spyOn(journeyCache, "del");
 
       // Re-mock the journeys module with our custom implementation.
       jest.doMock("./journeys", () => ({
         triggerEventEntryJourneys: triggerEventEntryJourneysFactory({
-          journeyCache: new NodeCache(),
+          journeyCache,
           startKeyedJourneyImpl,
         }),
       }));
@@ -183,6 +198,106 @@ describe("apps", () => {
           userId: userId1,
         }),
       );
+    });
+
+    // ET-10394. submitBatchWithTriggers fires triggerEventEntryJourneys once per
+    // Track message via Promise.all. The cache used to store the resolved value and
+    // only after the load finished, so concurrent events all missed and each ran a
+    // full load. On a workspace with 44,286 journeys that was 3.3s of blocking CPU
+    // per event — a batch this size froze the pod until liveness killed it.
+    // Counting findMany is the direct measure: one load for three concurrent
+    // triggers. Before the fix it was three.
+    it("loads a workspace's journeys once per batch, not once per event", async () => {
+      const userId = uuidv4();
+      const dbModule = await import("./db");
+      const findMany = jest.spyOn(dbModule.db().query.journey, "findMany");
+
+      try {
+        await submitBatchWithTriggers({
+          workspaceId,
+          data: {
+            batch: [1, 2, 3].map(() => ({
+              type: EventType.Track,
+              event: entryEventName,
+              messageId: uuidv4(),
+              userId,
+              properties: { amount: 100, itemId: "123" },
+            })),
+          },
+        });
+
+        // The direct measure: three concurrent triggers, one load. Before the fix
+        // this was three.
+        expect(findMany).toHaveBeenCalledTimes(1);
+        expect(startKeyedJourneyImpl).toHaveBeenCalledTimes(3);
+
+        // And a SECOND batch inside the TTL must be served from cache. This is the
+        // property that matters and the one nothing covered: an earlier revision
+        // stamped the TTL at store time instead of resolve, so the entry expired
+        // before it ever served a hit — the cache never populated and every test
+        // above still passed.
+        await submitBatchWithTriggers({
+          workspaceId,
+          data: {
+            batch: [
+              {
+                type: EventType.Track,
+                event: entryEventName,
+                messageId: uuidv4(),
+                userId,
+                properties: { amount: 100, itemId: "123" },
+              },
+            ],
+          },
+        });
+        expect(findMany).toHaveBeenCalledTimes(1);
+      } finally {
+        findMany.mockRestore();
+      }
+    });
+
+    // A rejected load must not stay in the cache. Without the catch that evicts it,
+    // one failed query would be handed to every caller of that workspace for the
+    // whole 30s TTL — a worse outage than the one this change fixes.
+    it("does not leave a failed load in the cache", async () => {
+      const dbModule = await import("./db");
+      const findMany = jest
+        .spyOn(dbModule.db().query.journey, "findMany")
+        .mockRejectedValueOnce(new Error("load failed"));
+
+      const oneTrackEvent = () => ({
+        workspaceId,
+        data: {
+          batch: [
+            {
+              type: EventType.Track as const,
+              event: entryEventName,
+              messageId: uuidv4(),
+              userId: uuidv4(),
+              properties: { amount: 100, itemId: "123" },
+            },
+          ],
+        },
+      });
+
+      try {
+        await expect(submitBatchWithTriggers(oneTrackEvent())).rejects.toThrow(
+          "load failed",
+        );
+        expect(journeyCacheDel).toHaveBeenCalledWith(workspaceId);
+        expect(journeyCache.get(workspaceId)).toBeUndefined();
+      } finally {
+        findMany.mockRestore();
+      }
+
+      // The next caller retries instead of being handed the cached rejection.
+      // toBeDefined() would not prove that: the cache holds a promise written
+      // before the await, so a REJECTED one is "defined" too. Resolve it instead —
+      // beforeEach inserts exactly one Running EventEntryNode journey.
+      await submitBatchWithTriggers(oneTrackEvent());
+      await expect(
+        journeyCache.get<Promise<unknown[]>>(workspaceId),
+      ).resolves.toHaveLength(1);
     });
   });
 });
