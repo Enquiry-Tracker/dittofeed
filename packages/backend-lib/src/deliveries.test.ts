@@ -158,6 +158,90 @@ describe("deliveries", () => {
         expect(deliveries.items).toHaveLength(1);
       });
     });
+    /**
+     * ET-9318. A message's status is derived with argMax(event, event_time). When two status
+     * events share an event_time the argMax is a tie, and ClickHouse resolves ties arbitrarily,
+     * so the engagement event can lose to the delivery and the row reads "Delivered" forever.
+     *
+     * This was not hypothetical: the Resend converter stamped every webhook for one email with
+     * the email's creation time, so on prod 10,630 of 10,630 opens in seven days collided with
+     * their own Delivered. That converter is fixed separately, but the tie-break has to exist
+     * independently — it is what makes the already-recorded history display correctly, without
+     * rewriting event_time in ClickHouse, and what keeps a future collision from hiding a status.
+     */
+    describe("when a status event shares its timestamp with the delivery", () => {
+      let originMessageId: string;
+      let userId: string;
+
+      beforeEach(async () => {
+        originMessageId = randomUUID();
+        userId = randomUUID();
+        const collidingTimestamp = new Date().toISOString();
+
+        const sent: BatchItem = {
+          userId,
+          timestamp: collidingTimestamp,
+          type: EventType.Track,
+          // Status events link to the send through its OWN messageId, not properties.messageId —
+          // internal_events exposes the former as message_id and the latter as origin_message_id,
+          // and the join is ms.message_id = se.origin_message_id.
+          messageId: originMessageId,
+          event: InternalEventType.MessageSent,
+          properties: {
+            workspaceId,
+            journeyId: randomUUID(),
+            nodeId: randomUUID(),
+            runId: randomUUID(),
+            messageId: randomUUID(),
+            templateId: randomUUID(),
+            variant: {
+              type: ChannelType.Email,
+              from: "test-from@email.com",
+              to: "test-to@email.com",
+              body: "body",
+              subject: "subject",
+              provider: { type: EmailProviderType.SendGrid },
+            },
+          },
+        };
+
+        // Identical timestamps on purpose — this is the condition under test.
+        const status = (event: InternalEventType): BatchItem => ({
+          userId,
+          timestamp: collidingTimestamp,
+          type: EventType.Track,
+          messageId: randomUUID(),
+          event,
+          properties: { workspaceId, messageId: originMessageId },
+        });
+
+        // Each Resend webhook is its own request, so delivered and opened are ingested
+        // separately and land with different processing times. Only event_time collides.
+        const ingestedAt = Date.now();
+        await submitBatch(
+          {
+            workspaceId,
+            data: { batch: [sent, status(InternalEventType.EmailDelivered)] },
+          },
+          { processingTime: ingestedAt },
+        );
+        await submitBatch(
+          {
+            workspaceId,
+            data: { batch: [status(InternalEventType.EmailOpened)] },
+          },
+          { processingTime: ingestedAt + 2000 },
+        );
+      });
+
+      it("reports the later lifecycle stage rather than resolving the tie arbitrarily", async () => {
+        const deliveries = await searchDeliveries({ workspaceId, limit: 10 });
+
+        expect(deliveries.items).toHaveLength(1);
+        expect(deliveries.items[0]?.status).toBe(InternalEventType.EmailOpened);
+      });
+    });
+
     describe("when the original sent message includes a triggeringMessageId", () => {
       let triggeringMessageId: string;
       beforeEach(async () => {

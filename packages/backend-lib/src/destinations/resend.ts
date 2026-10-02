@@ -69,7 +69,7 @@ export function resendEventToDF({
 }): Result<BatchItem, Error> {
   const { type: event } = resendEvent;
   // eslint-disable-next-line @typescript-eslint/naming-convention
-  const { created_at, email_id, to } = resendEvent.data;
+  const { email_id, to } = resendEvent.data;
 
   // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
   const email = to[0]!;
@@ -105,7 +105,14 @@ export function resendEventToDF({
       return err(new Error(`Unhandled event type: ${event}`));
   }
 
-  const timestamp = new Date(created_at).toISOString();
+  // ET-9318: the envelope's `created_at` is when the EVENT happened; `data.created_at` is when
+  // the EMAIL was created and is identical across every webhook for that email. Reading the
+  // latter gave delivered, opened and clicked the same `event_time`, and the deliveries view
+  // derives a message's status with argMax(event, event_time) — so identical timestamps made it
+  // a tie that ClickHouse resolved arbitrarily, in practice always to Delivered. On prod before
+  // this fix, 10,630 of 10,630 opens in seven days collided with their own Delivered, so no
+  // message ever displayed Opened or Clicked.
+  const timestamp = new Date(resendEvent.created_at).toISOString();
   const properties: Record<string, string> = R.merge(
     { email },
     R.pick(resendEvent.data.tags, MESSAGE_METADATA_FIELDS),

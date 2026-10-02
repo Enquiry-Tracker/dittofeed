@@ -402,7 +402,18 @@ export function buildDeliverySearchQueryBody({
         workspace_id,
         user_or_anonymous_id,
         origin_message_id,
-        argMax(event, event_time) as last_event,
+        -- ET-9318: order by (event_time, processing_time), not event_time alone. The Resend
+        -- converter stamped every webhook for one email with the email's creation time, so on
+        -- prod 10,630 of 10,630 opens in seven days shared an event_time with their own
+        -- Delivered. argMax resolves a tie arbitrarily, and it resolved to Delivered every
+        -- time, so no message ever displayed Opened or Clicked.
+        -- processing_time is the ingestion moment and was always recorded correctly, so it
+        -- separates them without inventing a precedence between statuses — and because it
+        -- needs no rewrite of event_time, the history already in ClickHouse displays correctly
+        -- as soon as this ships.
+        -- ponytail: events sharing BOTH timestamps (one import batch, not webhooks) stay
+        -- arbitrary; add a status rank as a third key if that ever matters.
+        argMax(event, (event_time, processing_time)) as last_event,
         max(event_time) as max_event_time
       FROM internal_events
       WHERE
