@@ -3,7 +3,9 @@ import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 import { pick, times } from "remeda";
 
 import { submitBatch } from "./apps/batch";
+import { ClickHouseQueryBuilder } from "./clickhouse";
 import {
+  buildDeliverySearchQueryBody,
   getDeliveryBody,
   parseSearchDeliveryRow,
   searchDeliveries,
@@ -158,6 +160,30 @@ describe("deliveries", () => {
         expect(deliveries.items).toHaveLength(1);
       });
     });
+    /**
+     * ET-9318 regression guard, and deliberately a guard on the QUERY rather than on behaviour.
+     *
+     * The integration test below proves the tie-break works, but it cannot prove the absence of
+     * the tie-break breaks anything: without it argMax picks arbitrarily, and "arbitrarily"
+     * resolved to Delivered on prod while resolving to Opened in this test environment. Reverting
+     * the fix leaves that test green, so it is documentation, not protection.
+     *
+     * Asserting the ordering key is the only check that actually fails on a revert. It is coupled
+     * to the query text, which is the price of guarding a non-deterministic bug.
+     */
+    describe("the status ordering key", () => {
+      it("breaks event_time ties on processing_time", () => {
+        const { statusEventsCte } = buildDeliverySearchQueryBody({
+          params: { workspaceId },
+          qb: new ClickHouseQueryBuilder(),
+        });
+
+        expect(statusEventsCte).toContain(
+          "argMax(event, (event_time, processing_time))",
+        );
+      });
+    });
+
     /**
      * ET-9318. A message's status is derived with argMax(event, event_time). When two status
      * events share an event_time the argMax is a tie, and ClickHouse resolves ties arbitrarily,
