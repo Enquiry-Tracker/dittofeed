@@ -26,6 +26,37 @@ import {
 } from "./types";
 import { createWorkspace } from "./workspaces";
 
+/**
+ * ET-9318 regression guard, deliberately on the QUERY rather than on behaviour.
+ *
+ * The integration test in the suite below proves the tie-break works. It cannot prove its
+ * absence breaks anything: without it argMax picks arbitrarily, and "arbitrarily" resolved to
+ * Delivered on prod while resolving to Opened in every local run. Reverting the fix leaves that
+ * test green, so it documents the behaviour rather than protecting it.
+ *
+ * Local tests also run with writeMode "ch-sync" and pass processingTime explicitly, so none of
+ * them exercise the async_insert block semantics the fix actually depends on. Asserting the
+ * ordering key is the only check that fails on a revert.
+ *
+ * It sits in its own top-level describe because buildDeliverySearchQueryBody is pure and needs
+ * no workspace row. It is NOT infrastructure-free: jest.config.js sets globalSetup per project,
+ * so the backend-lib project still connects to Postgres and ClickHouse before any file runs.
+ * Making this runnable in a unit-only CI stage would mean moving it to its own jest project.
+ */
+describe("deliveries status ordering key (ET-9318)", () => {
+  it("breaks event_time ties on processing_time", () => {
+    const { statusEventsCte } = buildDeliverySearchQueryBody({
+      params: { workspaceId: "00000000-0000-4000-8000-000000000000" },
+      qb: new ClickHouseQueryBuilder(),
+    });
+
+    // Whitespace-tolerant: reformatting the SQL must not fail the guard.
+    expect(statusEventsCte).toMatch(
+      /argMax\(\s*event,\s*\(\s*event_time,\s*processing_time\s*\)\s*\)/,
+    );
+  });
+});
+
 describe("deliveries", () => {
   let workspaceId: string;
 
@@ -160,30 +191,6 @@ describe("deliveries", () => {
         expect(deliveries.items).toHaveLength(1);
       });
     });
-    /**
-     * ET-9318 regression guard, and deliberately a guard on the QUERY rather than on behaviour.
-     *
-     * The integration test below proves the tie-break works, but it cannot prove the absence of
-     * the tie-break breaks anything: without it argMax picks arbitrarily, and "arbitrarily"
-     * resolved to Delivered on prod while resolving to Opened in this test environment. Reverting
-     * the fix leaves that test green, so it is documentation, not protection.
-     *
-     * Asserting the ordering key is the only check that actually fails on a revert. It is coupled
-     * to the query text, which is the price of guarding a non-deterministic bug.
-     */
-    describe("the status ordering key", () => {
-      it("breaks event_time ties on processing_time", () => {
-        const { statusEventsCte } = buildDeliverySearchQueryBody({
-          params: { workspaceId },
-          qb: new ClickHouseQueryBuilder(),
-        });
-
-        expect(statusEventsCte).toContain(
-          "argMax(event, (event_time, processing_time))",
-        );
-      });
-    });
-
     /**
      * ET-9318. A message's status is derived with argMax(event, event_time). When two status
      * events share an event_time the argMax is a tie, and ClickHouse resolves ties arbitrarily,

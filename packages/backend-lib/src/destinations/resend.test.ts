@@ -4,18 +4,6 @@ import { EventType } from "isomorphic-lib/src/types";
 import { InternalEventType, ResendEvent, ResendEventType } from "../types";
 import { resendEventToDF } from "./resend";
 
-/**
- * ET-9318. Every Resend webhook for one email carried the SAME timestamp, because the
- * converter read `data.created_at` — when the EMAIL was created — rather than the envelope's
- * `created_at`, which is when the EVENT happened. Delivered, opened and clicked therefore
- * landed in ClickHouse with identical `event_time`.
- *
- * That is not cosmetic: the deliveries panel derives a message's status with
- * `argMax(event, event_time)`, so identical timestamps make it a tie that ClickHouse resolves
- * arbitrarily — in practice always to Delivered. Measured on prod before the fix, 10,630 of
- * 10,630 opens in seven days collided with their own Delivered, so no message ever displayed
- * "Opened" or "Clicked".
- */
 const WORKSPACE_ID = "00000000-0000-4000-8000-000000000000";
 
 /** Envelope time and email-creation time deliberately differ — that difference is the bug. */
@@ -34,6 +22,11 @@ function event(type: ResendEventType, eventTime: string): ResendEvent {
   };
 }
 
+/**
+ * ET-9318. The converter read `data.created_at` — when the EMAIL was created, identical across
+ * every webhook for it — instead of the envelope's `created_at`, when the EVENT happened. That
+ * collapsed delivered/opened/clicked onto one event_time; deliveries.ts explains what it broke.
+ */
 describe("resendEventToDF timestamps (ET-9318)", () => {
   it("stamps an open with the moment it was opened, not the moment the email was created", () => {
     const item = unwrap(
@@ -65,11 +58,16 @@ describe("resendEventToDF timestamps (ET-9318)", () => {
       }),
     );
 
-    expect(delivered.timestamp).toBeDefined();
-    expect(opened.timestamp).toBeDefined();
-    expect(opened.timestamp).not.toBe(delivered.timestamp);
-    expect(new Date(String(opened.timestamp)).getTime()).toBeGreaterThan(
-      new Date(String(delivered.timestamp)).getTime(),
+    // Narrow once; the throw is itself the assertion that both are set.
+    const { timestamp: deliveredAt } = delivered;
+    const { timestamp: openedAt } = opened;
+    if (!deliveredAt || !openedAt) {
+      throw new Error("expected both events to carry a timestamp");
+    }
+
+    expect(openedAt).not.toBe(deliveredAt);
+    expect(new Date(openedAt).getTime()).toBeGreaterThan(
+      new Date(deliveredAt).getTime(),
     );
   });
 
