@@ -27,24 +27,19 @@ import {
 import { createWorkspace } from "./workspaces";
 
 /**
- * ET-9318 regression guard, deliberately on the QUERY rather than on behaviour.
+ * ET-9318 regression guard on the QUERY, alongside the behavioural test below.
  *
- * The integration test in the suite below proves the tie-break works. It cannot prove its
- * absence breaks anything: without it argMax picks arbitrarily, and "arbitrarily" resolved to
- * Delivered on prod while resolving to Opened in every local run. Reverting the fix leaves that
- * test green, so it documents the behaviour rather than protecting it.
- *
- * Local tests also run with writeMode "ch-sync" and pass processingTime explicitly, so none of
- * them exercise the async_insert block semantics the fix actually depends on. Asserting the
- * ordering key is the only check that fails on a revert.
+ * The behavioural test catches a fallback to arrival order (processing_time), because it
+ * ingests Opened before Delivered. It cannot catch dropping the tie-break altogether: argMax
+ * then picks arbitrarily, which resolved to Delivered on prod but to Opened in every local
+ * run. Asserting the ordering key is what fails on that revert.
  *
  * It sits in its own top-level describe because buildDeliverySearchQueryBody is pure and needs
  * no workspace row. It is NOT infrastructure-free: jest.config.js sets globalSetup per project,
  * so the backend-lib project still connects to Postgres and ClickHouse before any file runs.
- * Making this runnable in a unit-only CI stage would mean moving it to its own jest project.
  */
 describe("deliveries status ordering key (ET-9318)", () => {
-  it("breaks event_time ties on processing_time", () => {
+  it("breaks event_time ties on lifecycle rank", () => {
     const { statusEventsCte } = buildDeliverySearchQueryBody({
       params: { workspaceId: "00000000-0000-4000-8000-000000000000" },
       qb: new ClickHouseQueryBuilder(),
@@ -52,7 +47,7 @@ describe("deliveries status ordering key (ET-9318)", () => {
 
     // Whitespace-tolerant: reformatting the SQL must not fail the guard.
     expect(statusEventsCte).toMatch(
-      /argMax\(\s*event,\s*\(\s*event_time,\s*processing_time\s*\)\s*\)/,
+      /argMax\(\s*event,\s*\(\s*event_time,\s*transform\(\s*event,/,
     );
   });
 });
@@ -248,20 +243,20 @@ describe("deliveries", () => {
           properties: { workspaceId, messageId: originMessageId },
         });
 
-        // Each Resend webhook is its own request, so delivered and opened are ingested
-        // separately and land with different processing times. Only event_time collides.
+        // Resend does not guarantee webhook order, so Opened is deliberately ingested BEFORE
+        // Delivered. Arrival order would pick Delivered; lifecycle rank must still pick Opened.
         const ingestedAt = Date.now();
         await submitBatch(
           {
             workspaceId,
-            data: { batch: [sent, status(InternalEventType.EmailDelivered)] },
+            data: { batch: [status(InternalEventType.EmailOpened)] },
           },
           { processingTime: ingestedAt },
         );
         await submitBatch(
           {
             workspaceId,
-            data: { batch: [status(InternalEventType.EmailOpened)] },
+            data: { batch: [sent, status(InternalEventType.EmailDelivered)] },
           },
           { processingTime: ingestedAt + 2000 },
         );
