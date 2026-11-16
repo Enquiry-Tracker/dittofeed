@@ -214,8 +214,8 @@ describe("apps", () => {
 
     // Warming the cache must not change error semantics: if the first event's journey start
     // fails, the rest of the batch is still attempted (as with a plain Promise.all) and the
-    // batch still reports the failure. Guards the warm-up step, not the stampede: it passes
-    // on base too, and fails if the first trigger's error is allowed to skip the rest.
+    // batch still reports the failure. Every start is attempted before the batch rejects;
+    // base (plain Promise.all over cold loads) rejected after 1 of 3.
     it("still starts the rest of the batch when the first event's start fails", async () => {
       startKeyedJourneyImpl.mockRejectedValueOnce(new Error("temporal down"));
       const track = () => ({
