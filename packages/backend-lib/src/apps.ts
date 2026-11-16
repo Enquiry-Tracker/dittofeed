@@ -139,9 +139,14 @@ export async function submitBatchWithTriggers({
     },
   );
 
-  await Promise.all(
-    triggers.map((trigger) => triggerEventEntryJourneys(trigger)),
-  );
+  // ET-10394: the journey cache is written only once a load finishes, so firing every
+  // trigger at once made each event miss and load all of the workspace's journeys. The
+  // first trigger warms the cache; the rest of the batch then reads it.
+  const [first, ...rest] = triggers;
+  if (first) {
+    await triggerEventEntryJourneys(first);
+  }
+  await Promise.all(rest.map((trigger) => triggerEventEntryJourneys(trigger)));
 }
 
 export async function submitPage({
