@@ -107,6 +107,30 @@ interface BuildDeliverySearchQueryBodyArgs {
   qb: ClickHouseQueryBuilder;
 }
 
+/**
+ * ET-9318. A message's latest status: the newest event wins, and event_time ties are broken by
+ * lifecycle rank. Ties are real — the Resend converter used to stamp every webhook for one email
+ * with the email's creation time — and argMax resolves them arbitrarily, which hid Opened and
+ * Clicked behind Delivered. event_time stays the primary key, so a genuinely later event (a
+ * re-open after a click, a late bounce) still wins; the rank only decides exact ties.
+ * Not processing_time: that is webhook arrival order, wrong exactly when webhooks arrive out
+ * of order. Delivered < Opened < Clicked follows cascadingMessageFilters.ts; Dropped is lowest
+ * because Resend's delivery_delayed maps to it. Unranked events (SMS, sends, failures) are 0.
+ * Shared with journey stats so the panel and the stats agree.
+ */
+export const LAST_STATUS_EVENT_SQL = `argMax(
+  event,
+  (
+    event_time,
+    transform(
+      event,
+      ['${InternalEventType.EmailDropped}', '${InternalEventType.EmailDelivered}', '${InternalEventType.EmailBounced}', '${InternalEventType.EmailOpened}', '${InternalEventType.EmailClicked}', '${InternalEventType.EmailMarkedSpam}'],
+      [1, 2, 3, 4, 5, 6],
+      0
+    )
+  )
+)`;
+
 export function buildDeliverySearchQueryBody({
   params,
   qb,
@@ -402,29 +426,7 @@ export function buildDeliverySearchQueryBody({
         workspace_id,
         user_or_anonymous_id,
         origin_message_id,
-        -- ET-9318: break event_time ties on lifecycle rank. The Resend converter stamped every
-        -- webhook for one email with the email's creation time, so on prod 10,630 of 10,630
-        -- opens in seven days shared an event_time with their own Delivered, and argMax
-        -- resolved the tie to Delivered every time. The rank separates them in place, so
-        -- history already in ClickHouse displays correctly without rewriting event_time.
-        -- Not processing_time: that is webhook arrival order, wrong exactly when webhooks
-        -- arrive out of order, and per-block under async_insert. Order matches
-        -- dashboard/src/lib/cascadingMessageFilters.ts. Dropped is first because Resend's
-        -- delivery_delayed maps to it and is usually followed by delivered; a click after a
-        -- bounce is a provider error, so their relative rank does not matter. SMS events
-        -- rank 0 — Twilio timestamps each event itself, so they do not collide.
-        argMax(
-          event,
-          (
-            event_time,
-            transform(
-              event,
-              ['${InternalEventType.EmailDropped}', '${InternalEventType.EmailDelivered}', '${InternalEventType.EmailBounced}', '${InternalEventType.EmailOpened}', '${InternalEventType.EmailClicked}', '${InternalEventType.EmailMarkedSpam}'],
-              [1, 2, 3, 4, 5, 6],
-              0
-            )
-          )
-        ) as last_event,
+        ${LAST_STATUS_EVENT_SQL} as last_event,
         max(event_time) as max_event_time
       FROM internal_events
       WHERE

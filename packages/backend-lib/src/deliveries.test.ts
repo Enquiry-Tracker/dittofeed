@@ -31,8 +31,9 @@ import { createWorkspace } from "./workspaces";
  *
  * The behavioural test catches a fallback to arrival order (processing_time), because it
  * ingests Opened before Delivered. It cannot catch dropping the tie-break altogether: argMax
- * then picks arbitrarily, which resolved to Delivered on prod but to Opened in every local
- * run. Asserting the ordering key is what fails on that revert.
+ * then picks by ClickHouse read/part order, which resolved to Delivered on prod but to Opened
+ * for this single-message fixture locally. Asserting the ordering key is what fails on that
+ * revert. (journeys.test.ts ties ten messages instead, where the same order varies per message.)
  *
  * It sits in its own top-level describe because buildDeliverySearchQueryBody is pure and needs
  * no workspace row. It is NOT infrastructure-free: jest.config.js sets globalSetup per project,
@@ -192,8 +193,8 @@ describe("deliveries", () => {
      * so the engagement event can lose to the delivery and the row reads "Delivered" forever.
      *
      * This was not hypothetical: the Resend converter stamped every webhook for one email with
-     * the email's creation time, so on prod 10,630 of 10,630 opens in seven days collided with
-     * their own Delivered. That converter is fixed separately, but the tie-break has to exist
+     * the email's creation time, so on prod every open collided with its own Delivered (see
+     * ET-9318 for the numbers). That converter is fixed separately, but the tie-break has to exist
      * independently — it is what makes the already-recorded history display correctly, without
      * rewriting event_time in ClickHouse, and what keeps a future collision from hiding a status.
      */

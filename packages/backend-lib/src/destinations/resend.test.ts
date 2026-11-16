@@ -84,4 +84,15 @@ describe("resendEventToDF timestamps (ET-9318)", () => {
       throw new Error(`expected a track event, got ${item.type}`);
     expect(item.event).toBe(InternalEventType.EmailClicked);
   });
+
+  // An unparsable envelope time must come back as an err, not throw: a throw escapes
+  // submitResendEvents' mapErr, the webhook answers 500, and Resend retries it forever.
+  it("returns an err for an unparsable created_at instead of throwing", () => {
+    const result = resendEventToDF({
+      workspaceId: WORKSPACE_ID,
+      resendEvent: event(ResendEventType.Opened, "garbage"),
+    });
+
+    expect(result.isErr()).toBe(true);
+  });
 });

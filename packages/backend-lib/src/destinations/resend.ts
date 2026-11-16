@@ -105,14 +105,17 @@ export function resendEventToDF({
       return err(new Error(`Unhandled event type: ${event}`));
   }
 
-  // ET-9318: the envelope's `created_at` is when the EVENT happened; `data.created_at` is when
-  // the EMAIL was created and is identical across every webhook for that email. Reading the
-  // latter gave delivered, opened and clicked the same `event_time`, and the deliveries view
-  // derives a message's status with argMax(event, event_time) — so identical timestamps made it
-  // a tie that ClickHouse resolved arbitrarily, in practice always to Delivered. On prod before
-  // this fix, 10,630 of 10,630 opens in seven days collided with their own Delivered, so no
-  // message ever displayed Opened or Clicked.
-  const timestamp = new Date(resendEvent.created_at).toISOString();
+  // ET-9318: the envelope's `created_at` is when the EVENT happened. `data.created_at` is when
+  // the EMAIL was created, identical across its webhooks, which collapsed delivered/opened/
+  // clicked onto one event_time. Unparsable input is an err, not a throw: a throw escapes
+  // submitResendEvents' mapErr, answers 500, and Resend retries the payload forever.
+  const eventTimeMs = Date.parse(resendEvent.created_at);
+  if (Number.isNaN(eventTimeMs)) {
+    return err(
+      new Error(`Unparsable Resend created_at: ${resendEvent.created_at}`),
+    );
+  }
+  const timestamp = new Date(eventTimeMs).toISOString();
   const properties: Record<string, string> = R.merge(
     { email },
     R.pick(resendEvent.data.tags, MESSAGE_METADATA_FIELDS),

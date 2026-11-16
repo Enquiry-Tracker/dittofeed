@@ -31,6 +31,7 @@ import { enqueueRecompute } from "./computedProperties/computePropertiesWorkflow
 import { QUEUE_ITEM_PRIORITIES } from "./constants";
 import { Db, db, insert, QueryError, queryResult } from "./db";
 import * as schema from "./db/schema";
+import { LAST_STATUS_EVENT_SQL } from "./deliveries";
 import {
   segmentUpdateSignal,
   userJourneyWorkflow,
@@ -335,7 +336,7 @@ export async function getJourneyMessageStats({
                     property_message_id,
                     message_id
                 ) AS resolved_message_id,
-                argMax(event, event_time) as last_event
+                ${LAST_STATUS_EVENT_SQL} as last_event
             FROM internal_events
             WHERE
                 workspace_id = ${qb.addQueryValue(workspaceId, "String")}
