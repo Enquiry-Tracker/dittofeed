@@ -159,12 +159,16 @@ export async function submitTwilioEvents({
         "Intermediate Twilio status, no event recorded",
       );
       return ok(undefined);
+    // A status in TwilioMessageStatus that is not handled above (e.g. receiving, read,
+    // canceled). A status outside the enum never gets here: route validation rejects it.
+    // The sid and status identify the callback; To/From are personal data and stay out.
     default:
       logger().error(
         {
           workspaceId,
           userId,
-          TwilioEvent,
+          smsStatus: TwilioEvent.SmsStatus,
+          messageSid: TwilioEvent.MessageSid,
         },
         "Unhandled Twilio event type",
       );

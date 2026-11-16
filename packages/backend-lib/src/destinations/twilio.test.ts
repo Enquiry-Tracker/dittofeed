@@ -1,5 +1,6 @@
 import { InternalEventType } from "isomorphic-lib/src/types";
 
+import logger from "../logger";
 import { TwilioInboundSchema, TwilioMessageStatus } from "../types";
 import { submitTwilioEvents } from "./twilio";
 
@@ -118,7 +119,22 @@ describe("submitTwilioEvents (ET-10281)", () => {
     });
   });
 
-  it("still errors on an unmodelled status, so a new one stays visible", async () => {
+  // Phone numbers are personal data and have no business in an error log; the sid and status
+  // are enough to find the callback in Twilio.
+  it("logs an unhandled status without the phone numbers", async () => {
+    const errorSpy = jest.spyOn(logger(), "error").mockImplementation(() => {});
+
+    await call({ ...baseEvent, SmsStatus: TwilioMessageStatus.Canceled });
+
+    expect(errorSpy).toHaveBeenCalled();
+    const logged = JSON.stringify(errorSpy.mock.calls);
+    expect(logged).not.toContain(baseEvent.To);
+    expect(logged).not.toContain(baseEvent.From);
+    expect(logged).toContain(baseEvent.MessageSid);
+    errorSpy.mockRestore();
+  });
+
+  it("errors on a status in the enum it does not handle", async () => {
     const result = await call({
       ...baseEvent,
       SmsStatus: TwilioMessageStatus.Canceled,
