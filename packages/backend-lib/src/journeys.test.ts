@@ -286,6 +286,75 @@ describe("journeys", () => {
         ]);
       });
     });
+    // ET-9318: history written by the old Resend converter gave delivered and opened the same
+    // event_time. Stats must break that tie on lifecycle rank, as the deliveries panel does,
+    // or the two views report different statuses for the same messages.
+    describe("when delivered and opened share an event_time", () => {
+      beforeEach(async () => {
+        // An unranked tie resolves by ClickHouse read/part order, which varies per message here
+        // (openRate 0.1-0.4 without the tie-break), so ten tied messages make it fail reliably.
+        const now = Date.now();
+        await Promise.all(
+          Array.from({ length: 10 }, () => {
+            const messageId = randomUUID();
+            const userId = randomUUID();
+            const properties = {
+              messageId,
+              nodeId: messageNodeId,
+              templateId: `template-${messageNodeId}`,
+              journeyId,
+              channel: ChannelType.Email,
+              runId: `run-${userId}`,
+            };
+            const tied = (event: InternalEventType) =>
+              submitTrack({
+                workspaceId,
+                data: {
+                  userId,
+                  messageId: randomUUID(),
+                  event,
+                  timestamp: new Date(now + 100).toISOString(),
+                  properties,
+                },
+              });
+
+            return Promise.all([
+              submitTrack({
+                workspaceId,
+                data: {
+                  userId,
+                  messageId,
+                  event: InternalEventType.MessageSent,
+                  timestamp: new Date(now).toISOString(),
+                  properties: {
+                    ...properties,
+                    from: "from@email.com",
+                    to: "to@email.com",
+                    body: "hello",
+                    subject: "hello",
+                  },
+                },
+              }),
+              tied(InternalEventType.EmailDelivered),
+              tied(InternalEventType.EmailOpened),
+            ]);
+          }),
+        );
+      });
+
+      it("counts every tied message as opened", async () => {
+        const stats = await getJourneyMessageStats({
+          workspaceId,
+          journeys: [
+            {
+              id: journeyId,
+              nodes: [{ id: messageNodeId, channel: ChannelType.Email }],
+            },
+          ],
+        });
+        expect(stats[0]?.stats.channelStats).toMatchObject({ openRate: 1 });
+      });
+    });
   });
   describe("getJourneysStats", () => {
     let journeyId: string;

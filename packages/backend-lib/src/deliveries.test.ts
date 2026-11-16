@@ -3,7 +3,9 @@ import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 import { pick, times } from "remeda";
 
 import { submitBatch } from "./apps/batch";
+import { ClickHouseQueryBuilder } from "./clickhouse";
 import {
+  buildDeliverySearchQueryBody,
   getDeliveryBody,
   parseSearchDeliveryRow,
   searchDeliveries,
@@ -23,6 +25,33 @@ import {
   SmsProviderType,
 } from "./types";
 import { createWorkspace } from "./workspaces";
+
+/**
+ * ET-9318 regression guard on the QUERY, alongside the behavioural test below.
+ *
+ * The behavioural test catches a fallback to arrival order (processing_time), because it
+ * ingests Opened before Delivered. It cannot catch dropping the tie-break altogether: argMax
+ * then picks by ClickHouse read/part order, which resolved to Delivered on prod but to Opened
+ * for this single-message fixture locally. Asserting the ordering key is what fails on that
+ * revert. (journeys.test.ts ties ten messages instead, where the same order varies per message.)
+ *
+ * It sits in its own top-level describe because buildDeliverySearchQueryBody is pure and needs
+ * no workspace row. It is NOT infrastructure-free: jest.config.js sets globalSetup per project,
+ * so the backend-lib project still connects to Postgres and ClickHouse before any file runs.
+ */
+describe("deliveries status ordering key (ET-9318)", () => {
+  it("breaks event_time ties on lifecycle rank", () => {
+    const { statusEventsCte } = buildDeliverySearchQueryBody({
+      params: { workspaceId: "00000000-0000-4000-8000-000000000000" },
+      qb: new ClickHouseQueryBuilder(),
+    });
+
+    // Whitespace-tolerant: reformatting the SQL must not fail the guard.
+    expect(statusEventsCte).toMatch(
+      /argMax\(\s*event,\s*\(\s*event_time,\s*transform\(\s*event,/,
+    );
+  });
+});
 
 describe("deliveries", () => {
   let workspaceId: string;
@@ -158,6 +187,90 @@ describe("deliveries", () => {
         expect(deliveries.items).toHaveLength(1);
       });
     });
+    /**
+     * ET-9318. A message's status is derived with argMax(event, event_time). When two status
+     * events share an event_time the argMax is a tie, and ClickHouse resolves ties arbitrarily,
+     * so the engagement event can lose to the delivery and the row reads "Delivered" forever.
+     *
+     * This was not hypothetical: the Resend converter stamped every webhook for one email with
+     * the email's creation time, so on prod every open collided with its own Delivered (see
+     * ET-9318 for the numbers). That converter is fixed separately, but the tie-break has to exist
+     * independently — it is what makes the already-recorded history display correctly, without
+     * rewriting event_time in ClickHouse, and what keeps a future collision from hiding a status.
+     */
+    describe("when a status event shares its timestamp with the delivery", () => {
+      let originMessageId: string;
+      let userId: string;
+
+      beforeEach(async () => {
+        originMessageId = randomUUID();
+        userId = randomUUID();
+        const collidingTimestamp = new Date().toISOString();
+
+        const sent: BatchItem = {
+          userId,
+          timestamp: collidingTimestamp,
+          type: EventType.Track,
+          // Status events link to the send through its OWN messageId, not properties.messageId —
+          // internal_events exposes the former as message_id and the latter as origin_message_id,
+          // and the join is ms.message_id = se.origin_message_id.
+          messageId: originMessageId,
+          event: InternalEventType.MessageSent,
+          properties: {
+            workspaceId,
+            journeyId: randomUUID(),
+            nodeId: randomUUID(),
+            runId: randomUUID(),
+            messageId: randomUUID(),
+            templateId: randomUUID(),
+            variant: {
+              type: ChannelType.Email,
+              from: "test-from@email.com",
+              to: "test-to@email.com",
+              body: "body",
+              subject: "subject",
+              provider: { type: EmailProviderType.SendGrid },
+            },
+          },
+        };
+
+        // Identical timestamps on purpose — this is the condition under test.
+        const status = (event: InternalEventType): BatchItem => ({
+          userId,
+          timestamp: collidingTimestamp,
+          type: EventType.Track,
+          messageId: randomUUID(),
+          event,
+          properties: { workspaceId, messageId: originMessageId },
+        });
+
+        // Resend does not guarantee webhook order, so Opened is deliberately ingested BEFORE
+        // Delivered. Arrival order would pick Delivered; lifecycle rank must still pick Opened.
+        const ingestedAt = Date.now();
+        await submitBatch(
+          {
+            workspaceId,
+            data: { batch: [status(InternalEventType.EmailOpened)] },
+          },
+          { processingTime: ingestedAt },
+        );
+        await submitBatch(
+          {
+            workspaceId,
+            data: { batch: [sent, status(InternalEventType.EmailDelivered)] },
+          },
+          { processingTime: ingestedAt + 2000 },
+        );
+      });
+
+      it("reports the later lifecycle stage rather than resolving the tie arbitrarily", async () => {
+        const deliveries = await searchDeliveries({ workspaceId, limit: 10 });
+
+        expect(deliveries.items).toHaveLength(1);
+        expect(deliveries.items[0]?.status).toBe(InternalEventType.EmailOpened);
+      });
+    });
+
     describe("when the original sent message includes a triggeringMessageId", () => {
       let triggeringMessageId: string;
       beforeEach(async () => {

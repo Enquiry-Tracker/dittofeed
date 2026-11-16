@@ -69,7 +69,7 @@ export function resendEventToDF({
 }): Result<BatchItem, Error> {
   const { type: event } = resendEvent;
   // eslint-disable-next-line @typescript-eslint/naming-convention
-  const { created_at, email_id, to } = resendEvent.data;
+  const { email_id, to } = resendEvent.data;
 
   // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
   const email = to[0]!;
@@ -105,7 +105,17 @@ export function resendEventToDF({
       return err(new Error(`Unhandled event type: ${event}`));
   }
 
-  const timestamp = new Date(created_at).toISOString();
+  // ET-9318: the envelope's `created_at` is when the EVENT happened. `data.created_at` is when
+  // the EMAIL was created, identical across its webhooks, which collapsed delivered/opened/
+  // clicked onto one event_time. Unparsable input is an err, not a throw: a throw escapes
+  // submitResendEvents' mapErr, answers 500, and Resend retries the payload forever.
+  const eventTimeMs = Date.parse(resendEvent.created_at);
+  if (Number.isNaN(eventTimeMs)) {
+    return err(
+      new Error(`Unparsable Resend created_at: ${resendEvent.created_at}`),
+    );
+  }
+  const timestamp = new Date(eventTimeMs).toISOString();
   const properties: Record<string, string> = R.merge(
     { email },
     R.pick(resendEvent.data.tags, MESSAGE_METADATA_FIELDS),
