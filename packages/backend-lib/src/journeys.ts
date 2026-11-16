@@ -688,6 +688,10 @@ export async function getJourneysStats({
 const EVENT_TRIGGER_JOURNEY_CACHE = new NodeCache({
   stdTTL: 30,
   checkperiod: 120,
+  // ET-10394: every event of a batch reads this entry, and the default deep-clones all of
+  // the workspace's journey definitions on each get. Nothing on the trigger path mutates
+  // them, so share the reference.
+  useClones: false,
 });
 
 let JOURNEY_TRIGGER_COUNTER: Counter | null = null;

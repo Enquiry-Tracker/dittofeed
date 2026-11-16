@@ -184,5 +184,55 @@ describe("apps", () => {
         }),
       );
     });
+
+    // ET-10394. Every Track message of a batch triggers event-entry journeys concurrently. The
+    // journey cache is only written once a load finishes, so firing them all at once made
+    // every event miss and run its own full load of the workspace's journeys.
+    it("loads a workspace's journeys once per batch, not once per event", async () => {
+      const userId = uuidv4();
+      const dbModule = await import("./db");
+      const findMany = jest.spyOn(dbModule.db().query.journey, "findMany");
+      const track = () => ({
+        type: EventType.Track as const,
+        event: entryEventName,
+        messageId: uuidv4(),
+        userId,
+        properties: { amount: 100, itemId: "123" },
+      });
+
+      try {
+        await submitBatchWithTriggers({
+          workspaceId,
+          data: { batch: [track(), track(), track()] },
+        });
+        expect(findMany).toHaveBeenCalledTimes(1);
+        expect(startKeyedJourneyImpl).toHaveBeenCalledTimes(3);
+      } finally {
+        findMany.mockRestore();
+      }
+    });
+
+    // Warming the cache must not swallow or skip anything: if the first event's journey start
+    // fails, every other start is still invoked and the batch still rejects. Base never skipped
+    // them either, but rejected before its other cold loads finished (1 of 3 invoked by then),
+    // so this also fails on base.
+    it("invokes every start before rejecting when the first event's start fails", async () => {
+      startKeyedJourneyImpl.mockRejectedValueOnce(new Error("temporal down"));
+      const track = () => ({
+        type: EventType.Track as const,
+        event: entryEventName,
+        messageId: uuidv4(),
+        userId: uuidv4(),
+        properties: { amount: 100, itemId: "123" },
+      });
+
+      await expect(
+        submitBatchWithTriggers({
+          workspaceId,
+          data: { batch: [track(), track(), track()] },
+        }),
+      ).rejects.toThrow("temporal down");
+      expect(startKeyedJourneyImpl).toHaveBeenCalledTimes(3);
+    });
   });
 });
