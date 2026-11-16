@@ -55,6 +55,9 @@ describe("submitTwilioEvents (ET-10281)", () => {
     mockSubmitBatch.mockResolvedValue(undefined);
   });
 
+  // Restores spies even when an assertion throws first.
+  afterEach(() => jest.restoreAllMocks());
+
   describe("undelivered — the carrier did not deliver a message Twilio accepted", () => {
     it("records a terminal failure instead of dropping the callback", async () => {
       const result = await call({
@@ -131,7 +134,6 @@ describe("submitTwilioEvents (ET-10281)", () => {
     expect(logged).not.toContain(baseEvent.To);
     expect(logged).not.toContain(baseEvent.From);
     expect(logged).toContain(baseEvent.MessageSid);
-    errorSpy.mockRestore();
   });
 
   it("errors on a status in the enum it does not handle", async () => {
