@@ -142,7 +142,7 @@ export async function submitBatchWithTriggers({
   // ET-10394: the journey cache is written only once a load finishes, so firing every
   // trigger at once made each event miss and load all of the workspace's journeys. The
   // first trigger warms the cache; the rest of the batch then reads it.
-  // Its failure is held until all have run, so one failed start does not skip the rest.
+  // Its failure is held until the rest have been started, then reported as before.
   // Cost: the rest also wait for the first event's journey starts, one Temporal round trip,
   // even when the cache is already warm.
   const [first, ...rest] = triggers;

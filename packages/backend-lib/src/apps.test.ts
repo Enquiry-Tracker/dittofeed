@@ -212,11 +212,11 @@ describe("apps", () => {
       }
     });
 
-    // Warming the cache must not change error semantics: if the first event's journey start
-    // fails, the rest of the batch is still attempted (as with a plain Promise.all) and the
-    // batch still reports the failure. Every start is attempted before the batch rejects;
-    // base (plain Promise.all over cold loads) rejected after 1 of 3.
-    it("still starts the rest of the batch when the first event's start fails", async () => {
+    // Warming the cache must not swallow or skip anything: if the first event's journey start
+    // fails, every other start is still invoked and the batch still rejects. Base never skipped
+    // them either, but rejected before its other cold loads finished (1 of 3 invoked by then),
+    // so this also fails on base.
+    it("invokes every start before rejecting when the first event's start fails", async () => {
       startKeyedJourneyImpl.mockRejectedValueOnce(new Error("temporal down"));
       const track = () => ({
         type: EventType.Track as const,
