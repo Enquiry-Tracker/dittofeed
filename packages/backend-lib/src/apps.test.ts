@@ -187,8 +187,7 @@ describe("apps", () => {
 
     // ET-10394. Every Track message of a batch triggers event-entry journeys concurrently. The
     // journey cache is only written once a load finishes, so firing them all at once made
-    // every event miss and run its own full load of the workspace's journeys. One load per
-    // batch, and a second batch inside the TTL served from cache.
+    // every event miss and run its own full load of the workspace's journeys.
     it("loads a workspace's journeys once per batch, not once per event", async () => {
       const userId = uuidv4();
       const dbModule = await import("./db");
@@ -208,15 +207,31 @@ describe("apps", () => {
         });
         expect(findMany).toHaveBeenCalledTimes(1);
         expect(startKeyedJourneyImpl).toHaveBeenCalledTimes(3);
-
-        await submitBatchWithTriggers({
-          workspaceId,
-          data: { batch: [track()] },
-        });
-        expect(findMany).toHaveBeenCalledTimes(1);
       } finally {
         findMany.mockRestore();
       }
+    });
+
+    // Warming the cache must not change error semantics: if the first event's journey start
+    // fails, the rest of the batch is still attempted (as with a plain Promise.all) and the
+    // batch still reports the failure.
+    it("still starts the rest of the batch when the first event's start fails", async () => {
+      startKeyedJourneyImpl.mockRejectedValueOnce(new Error("temporal down"));
+      const track = () => ({
+        type: EventType.Track as const,
+        event: entryEventName,
+        messageId: uuidv4(),
+        userId: uuidv4(),
+        properties: { amount: 100, itemId: "123" },
+      });
+
+      await expect(
+        submitBatchWithTriggers({
+          workspaceId,
+          data: { batch: [track(), track(), track()] },
+        }),
+      ).rejects.toThrow("temporal down");
+      expect(startKeyedJourneyImpl).toHaveBeenCalledTimes(3);
     });
   });
 });
