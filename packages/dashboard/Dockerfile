@@ -6,7 +6,10 @@ ARG APP_VERSION
 
 WORKDIR /app
 
-RUN apt-get update -y && \
+# bullseye is EOL: its security pool moved to archive.debian.org, while the index left on
+# deb.debian.org still lists those packages, so installs 404 there. Point apt at the archive.
+RUN sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|' /etc/apt/sources.list && \
+    apt-get update -y && \
     apt-get install -y openssl && \
     apt-get install -y curl
 
@@ -36,7 +39,8 @@ WORKDIR /app
 
 RUN yarn set version 4.1.1
 
-RUN apt-get update -y && \
+RUN sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|' /etc/apt/sources.list && \
+    apt-get update -y && \
     apt-get install -y openssl
 
 ENV NODE_ENV=production
